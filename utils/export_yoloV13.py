@@ -1,9 +1,28 @@
 import os
+import sys
 import onnx
 import torch
 import torch.nn as nn
+from copy import deepcopy
 
-from super_gradients.training import models
+from ultralytics import YOLO
+from ultralytics.nn.modules import C2f, Detect, v10Detect
+import ultralytics.utils
+import ultralytics.models.yolo
+import ultralytics.utils.tal as _m
+
+sys.modules["ultralytics.yolo"] = ultralytics.models.yolo
+sys.modules["ultralytics.yolo.utils"] = ultralytics.utils
+
+
+def _dist2bbox(distance, anchor_points, xywh=False, dim=-1):
+    lt, rb = distance.chunk(2, dim)
+    x1y1 = anchor_points - lt
+    x2y2 = anchor_points + rb
+    return torch.cat((x1y1, x2y2), dim)
+
+
+_m.dist2bbox.__code__ = _dist2bbox.__code__
 
 
 class DeepStreamOutput(nn.Module):
@@ -11,9 +30,29 @@ class DeepStreamOutput(nn.Module):
         super().__init__()
 
     def forward(self, x):
-        boxes = x[0]
-        scores, labels = torch.max(x[1], dim=-1, keepdim=True)
+        x = x.transpose(1, 2)
+        boxes = x[:, :, :4]
+        scores, labels = torch.max(x[:, :, 4:], dim=-1, keepdim=True)
         return torch.cat([boxes, scores, labels.to(boxes.dtype)], dim=-1)
+
+
+def yolov13_export(weights, device, fuse=True):
+    model = YOLO(weights)
+    model = deepcopy(model.model).to(device)
+    for p in model.parameters():
+        p.requires_grad = False
+    model.eval()
+    model.float()
+    if fuse:
+        model = model.fuse()
+    for k, m in model.named_modules():
+        if isinstance(m, (Detect, v10Detect)):
+            m.dynamic = False
+            m.export = True
+            m.format = "onnx"
+        elif isinstance(m, C2f):
+            m.forward = m.forward_split
+    return model
 
 
 def suppress_warnings():
@@ -25,23 +64,21 @@ def suppress_warnings():
     warnings.filterwarnings("ignore", category=ResourceWarning)
 
 
-def yolonas_export(model_name, weights, num_classes, size):
-    img_size = size * 2 if len(size) == 1 else size
-    model = models.get(model_name, num_classes=num_classes, checkpoint_path=weights)
-    model.eval()
-    model.prep_model_for_conversion(input_size=[1, 3, *img_size])
-    return model
-
-
 def main(args):
     suppress_warnings()
 
     print(f"\nStarting: {args.weights}")
 
-    print("Opening YOLO-NAS model")
+    print("Opening YOLOv13 model")
 
     device = torch.device("cpu")
-    model = yolonas_export(args.model, args.weights, args.classes, args.size)
+    model = yolov13_export(args.weights, device)
+
+    if len(model.names.keys()) > 0:
+        print("Creating labels.txt file")
+        with open("labels.txt", "w", encoding="utf-8") as f:
+            for name in model.names.values():
+                f.write(f"{name}\n")
 
     model = nn.Sequential(model, DeepStreamOutput())
 
@@ -84,10 +121,8 @@ def main(args):
 
 def parse_args():
     import argparse
-    parser = argparse.ArgumentParser(description="DeepStream YOLO-NAS conversion")
-    parser.add_argument("-m", "--model", required=True, type=str, help="Model name (required)")
-    parser.add_argument("-w", "--weights", required=True, type=str, help="Input weights (.pth) file path (required)")
-    parser.add_argument("-n", "--classes", type=int, default=80, help="Number of trained classes (default 80)")
+    parser = argparse.ArgumentParser(description="DeepStream YOLOv13 conversion")
+    parser.add_argument("-w", "--weights", required=True, type=str, help="Input weights (.pt) file path (required)")
     parser.add_argument("-s", "--size", nargs="+", type=int, default=[640], help="Inference size [H,W] (default [640])")
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset version")
     parser.add_argument("--simplify", action="store_true", help="ONNX simplify model")
